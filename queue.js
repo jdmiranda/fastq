@@ -19,6 +19,7 @@ function fastqueue (context, worker, _concurrency) {
   var queueHead = null
   var queueTail = null
   var _running = 0
+  var _length = 0
   var errorHandler = null
 
   var self = {
@@ -67,15 +68,7 @@ function fastqueue (context, worker, _concurrency) {
   }
 
   function length () {
-    var current = queueHead
-    var counter = 0
-
-    while (current) {
-      current = current.next
-      counter++
-    }
-
-    return counter
+    return _length
   }
 
   function getQueue () {
@@ -126,8 +119,10 @@ function fastqueue (context, worker, _concurrency) {
         queueTail = current
         self.saturated()
       }
+      _length++
     } else {
       _running++
+      // Fast path: execute immediately without additional checks
       worker.call(context, current.value, current.worked)
     }
   }
@@ -150,8 +145,10 @@ function fastqueue (context, worker, _concurrency) {
         queueTail = current
         self.saturated()
       }
+      _length++
     } else {
       _running++
+      // Fast path: execute immediately without additional checks
       worker.call(context, current.value, current.worked)
     }
   }
@@ -161,20 +158,20 @@ function fastqueue (context, worker, _concurrency) {
       cache.release(holder)
     }
     var next = queueHead
-    if (next && _running <= _concurrency) {
-      if (!self.paused) {
-        if (queueTail === queueHead) {
-          queueTail = null
-        }
-        queueHead = next.next
-        next.next = null
-        worker.call(context, next.value, next.worked)
-        if (queueTail === null) {
-          self.empty()
-        }
-      } else {
-        _running--
+    // Fast path: check if we can process next item
+    if (next && _running <= _concurrency && !self.paused) {
+      if (queueTail === queueHead) {
+        queueTail = null
       }
+      queueHead = next.next
+      next.next = null
+      _length--
+      worker.call(context, next.value, next.worked)
+      if (queueTail === null) {
+        self.empty()
+      }
+    } else if (self.paused && next) {
+      _running--
     } else if (--_running === 0) {
       self.drain()
     }
@@ -183,12 +180,14 @@ function fastqueue (context, worker, _concurrency) {
   function kill () {
     queueHead = null
     queueTail = null
+    _length = 0
     self.drain = noop
   }
 
   function killAndDrain () {
     queueHead = null
     queueTail = null
+    _length = 0
     self.drain()
     self.drain = noop
   }
@@ -211,16 +210,28 @@ function Task () {
   var self = this
 
   this.worked = function worked (err, result) {
+    // Cache values to avoid repeated property access
     var callback = self.callback
     var errorHandler = self.errorHandler
     var val = self.value
+    var ctx = self.context
+    var rel = self.release
+
+    // Reset state before calling handlers to enable immediate reuse
     self.value = null
     self.callback = noop
-    if (self.errorHandler) {
+    self.errorHandler = null
+
+    // Call error handler first if present and there's an error
+    if (errorHandler && err) {
       errorHandler(err, val)
     }
-    callback.call(self.context, err, result)
-    self.release(self)
+
+    // Call the task callback
+    callback.call(ctx, err, result)
+
+    // Release task back to pool
+    rel(self)
   }
 }
 
